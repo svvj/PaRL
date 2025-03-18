@@ -9,7 +9,7 @@
 <br>
 &dagger;corresponding author
 
-<a href=""><img src='https://img.shields.io/badge/arXiv-PanDA-red' alt='Paper PDF'></a>
+<a href="https://arxiv.org/abs/2406.13378v2"><img src='https://img.shields.io/badge/arXiv-PanDA-red' alt='Paper PDF'></a>
 <a href='https://caozidong.github.io/PanDA_Depth/'><img src='https://img.shields.io/badge/Project_Page-PanDA-green' alt='Project Page'></a>
 <a href='https://huggingface.co/spaces/ZidongC/PanDA_Panoramic_Depth_Estimation'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
 </div>
