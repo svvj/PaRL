@@ -9,7 +9,7 @@ model:
     train_decoder: True
     lora_rank: 4
 
-load_weights_dir: 
+load_weights_dir: /data/gpfs/projects/punim2482/workspace/PaRL/models/panda_large.pth
 
 
 

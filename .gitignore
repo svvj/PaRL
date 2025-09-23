@@ -1,0 +1,17 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.db
+*.sqlite3
+
+
+datasets/*.7z
+datasets/Diverse360.*
+
+models/*
+
+help
+vis_depth

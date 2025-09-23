@@ -35,7 +35,10 @@ if __name__ == '__main__':
 
     # Load pre-trained weights
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model_path = os.path.join(config["load_weights_dir"], 'model.pth')
+    if config['load_weights_dir'].endswith('.pth'):
+        model_path = config['load_weights_dir']
+    else:
+        model_path = os.path.join(config["load_weights_dir"], 'model.pth')
     model_dict = torch.load(model_path)
 
     # network
