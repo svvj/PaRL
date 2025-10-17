@@ -1,0 +1,655 @@
+import os
+import json
+import numpy as np
+import cv2
+import open3d as o3d
+from scipy.spatial.transform import Rotation
+from tqdm import tqdm
+import re
+import argparse
+
+def load_calibration(calib_file):
+    """캘리브레이션 파일에서 변환 행렬과 카메라 정보를 로드"""
+    with open(calib_file, 'r') as f:
+        calib_data = json.load(f)
+    
+    # 카메라→라이다 변환 (calib.json에 저장된 형식)
+    t_camera_lidar = calib_data['results']['T_lidar_camera']
+    translation = np.array(t_camera_lidar[:3])
+    quaternion = np.array(t_camera_lidar[3:])
+    
+    # 카메라→라이다 변환 행렬 생성
+    rotation = Rotation.from_quat(quaternion).as_matrix()
+    camera_to_lidar = np.eye(4)
+    camera_to_lidar[:3, :3] = rotation
+    camera_to_lidar[:3, 3] = translation
+    
+    # 라이다→카메라 변환은 역행렬
+    lidar_to_camera = np.linalg.inv(camera_to_lidar)
+    
+    # 카메라 정보 추출
+    camera_model = calib_data['camera']['camera_model']
+    intrinsics = calib_data['camera']['intrinsics']
+    
+    return lidar_to_camera, camera_model, intrinsics
+
+def load_pointcloud(pointcloud_file, max_distance=50.0):
+    """포인트 클라우드 파일을 로드하고 필터링"""
+    if pointcloud_file.endswith('.bin'):
+        with open(pointcloud_file, 'rb') as f:
+            data = f.read()
+        
+        try:
+            # XYZI 형식 (4채널) 시도
+            points = np.frombuffer(data, dtype=np.float32).reshape(-1, 4)
+            xyz = points[:, :3]
+            if points.shape[1] >= 4:
+                # 인텐시티가 있는 경우 저장
+                intensities = points[:, 3]
+            else:
+                intensities = None
+        except ValueError:
+            try:
+                # XYZ 형식 (3채널) 시도
+                xyz = np.frombuffer(data, dtype=np.float32).reshape(-1, 3)
+                intensities = None
+            except ValueError:
+                return None, None, None
+    else:
+        # Open3D 지원 형식
+        pcd = o3d.io.read_point_cloud(pointcloud_file)
+        if not pcd.has_points():
+            return None, None, None
+        xyz = np.asarray(pcd.points)
+        intensities = None
+    
+    # 유효한 포인트만 필터링
+    mask = np.all(np.isfinite(xyz), axis=1) & np.all(np.abs(xyz) < 100.0, axis=1)
+    xyz = xyz[mask]
+    
+    # 거리 기반 필터링
+    distances = np.linalg.norm(xyz, axis=1)
+    distance_mask = distances < max_distance
+    xyz = xyz[distance_mask]
+    
+    if intensities is not None:
+        intensities = intensities[mask][distance_mask]
+    
+    return xyz, distances[distance_mask], intensities
+
+def project_point_standard(point, width, height):
+    """표준 equirectangular 투영 공식 사용"""
+    depth = np.sqrt(np.sum(point**2))
+    if depth < 1e-5:
+        return None
+    
+    # 표준 공식: 
+    # longitude (φ) = arctan2(x, z)
+    # latitude (θ) = arcsin(y/depth)
+    phi = np.arctan2(point[0], point[2])  # x,z 사용 (전방 방향이 z축)
+    theta = np.arcsin(np.clip(point[1] / depth, -1.0, 1.0))  # y는 상하 방향
+    
+    if np.isnan(phi) or np.isnan(theta):
+        return None
+    
+    # 표준 변환:
+    # u = (φ/(2π) + 0.5) * width
+    # v = (0.5 - θ/π) * height
+    u = ((phi / (2 * np.pi)) + 0.5) * width
+    v = (0.5 - (theta / np.pi)) * height
+    
+    return int(u) % width, int(v) % height
+
+def apply_y_flip(point):
+    """Y축 반전 적용"""
+    return np.array([point[0], -point[1], point[2]])
+
+def extract_timestamp_from_filename(filename):
+    """파일명에서 정확한 타임스탬프 추출"""
+    # 확장자 제거
+    name = os.path.splitext(os.path.basename(filename))[0]
+    
+    # 파일명이 숫자로만 구성된 경우 (ROS 타임스탬프)
+    if name.isdigit():
+        return int(name)
+    
+    # 숫자가 포함된 경우, 가장 긴 연속된 숫자를 타임스탬프로 간주
+    numbers = re.findall(r'\d+', name)
+    if numbers:
+        # 가장 긴 숫자 문자열을 선택 (보통 타임스탬프가 가장 김)
+        longest_number = max(numbers, key=len)
+        return int(longest_number)
+    
+    return 0
+
+def convert_ns_to_index(timestamp_ns, min_timestamp, max_timestamp, total_count):
+    """나노초 타임스탬프를 인덱스로 변환"""
+    if max_timestamp == min_timestamp:
+        return 0
+    normalized = (timestamp_ns - min_timestamp) / (max_timestamp - min_timestamp)
+    return int(normalized * (total_count - 1))
+
+def find_nearest_by_sequence(image_files, pointcloud_files):
+    """시퀀스 기반 매칭 (타임스탬프가 다른 범위일 때)"""
+    print("=== 시퀀스 기반 매칭 사용 ===")
+    
+    # 이미지와 포인트클라우드를 시간순으로 정렬
+    img_with_ts = [(f, extract_timestamp_from_filename(f)) for f in image_files]
+    pc_with_ts = [(f, extract_timestamp_from_filename(f)) for f in pointcloud_files]
+    
+    img_with_ts.sort(key=lambda x: x[1])
+    pc_with_ts.sort(key=lambda x: x[1])
+    
+    # 이미지 개수에 맞춰 포인트클라우드 인덱스 계산
+    matches = []
+    for i, (img_file, img_ts) in enumerate(img_with_ts):
+        # 이미지 인덱스를 포인트클라우드 인덱스로 매핑
+        pc_idx = int((i / len(img_with_ts)) * len(pc_with_ts))
+        if pc_idx >= len(pc_with_ts):
+            pc_idx = len(pc_with_ts) - 1
+        
+        pc_file, pc_ts = pc_with_ts[pc_idx]
+        matches.append((img_file, pc_file, abs(i - pc_idx)))
+    
+    return matches
+
+def analyze_timestamps(image_files, pointcloud_files):
+    """타임스탬프 분석 및 매칭 전략 결정"""
+    print("=== 타임스탬프 분석 ===")
+    
+    # 이미지 타임스탬프 샘플
+    img_timestamps = []
+    for i, img_file in enumerate(image_files[:5]):  # 처음 5개만 분석
+        ts = extract_timestamp_from_filename(img_file)
+        img_timestamps.append(ts)
+        print(f"Image {i+1}: {img_file} -> {ts}")
+    
+    print()
+    
+    # 포인트클라우드 타임스탬프 샘플
+    pc_timestamps = []
+    for i, pc_file in enumerate(pointcloud_files[:5]):  # 처음 5개만 분석
+        ts = extract_timestamp_from_filename(pc_file)
+        pc_timestamps.append(ts)
+        print(f"PointCloud {i+1}: {os.path.basename(pc_file)} -> {ts}")
+    
+    print()
+    
+    # 타임스탬프 범위 분석
+    all_img_ts = [extract_timestamp_from_filename(f) for f in image_files]
+    all_pc_ts = [extract_timestamp_from_filename(f) for f in pointcloud_files]
+    
+    img_min, img_max = min(all_img_ts), max(all_img_ts)
+    pc_min, pc_max = min(all_pc_ts), max(all_pc_ts)
+    
+    print(f"이미지 타임스탬프 범위: {img_min} ~ {img_max}")
+    print(f"포인트클라우드 타임스탬프 범위: {pc_min} ~ {pc_max}")
+    print(f"이미지 개수: {len(image_files)}, 포인트클라우드 개수: {len(pointcloud_files)}")
+    
+    # 오버랩 확인
+    overlap_exists = not (img_max < pc_min or pc_max < img_min)
+    print(f"타임스탬프 오버랩 존재: {overlap_exists}")
+    
+    # 타임스탬프 차이 분석
+    if len(all_img_ts) > 1:
+        img_intervals = [all_img_ts[i+1] - all_img_ts[i] for i in range(len(all_img_ts)-1)]
+        avg_img_interval = np.mean(img_intervals)
+        print(f"평균 이미지 간격: {avg_img_interval:.0f} ns")
+    
+    if len(all_pc_ts) > 1:
+        pc_intervals = [all_pc_ts[i+1] - all_pc_ts[i] for i in range(len(all_pc_ts)-1)]
+        avg_pc_interval = np.mean(pc_intervals)
+        print(f"평균 포인트클라우드 간격: {avg_pc_interval:.0f} ns")
+    
+    # 매칭 전략 결정
+    if overlap_exists:
+        strategy = "timestamp"
+        print("전략: 타임스탬프 기반 매칭")
+    else:
+        strategy = "sequence"
+        print("전략: 시퀀스 기반 매칭 (타임스탬프 범위가 다름)")
+    
+    print("=" * 40)
+    
+    return all_img_ts, all_pc_ts, strategy
+
+def find_nearest_pointcloud_optimized(image_timestamp, pointcloud_files, pc_timestamps_cache=None):
+    """최적화된 가장 가까운 포인트클라우드 찾기"""
+    if pc_timestamps_cache is None:
+        pc_timestamps = [extract_timestamp_from_filename(f) for f in pointcloud_files]
+    else:
+        pc_timestamps = pc_timestamps_cache
+    
+    # 가장 가까운 타임스탬프 찾기
+    diffs = [abs(image_timestamp - pc_ts) for pc_ts in pc_timestamps]
+    min_idx = np.argmin(diffs)
+    
+    return pointcloud_files[min_idx], diffs[min_idx]
+
+def project_lidar_to_image_no_calib(pc_file, img_file, width, height, output_dir):
+    """캘리브레이션 없이 라이다 포인트를 이미지에 투영"""
+    pc_name = os.path.basename(pc_file).replace('.bin', '')
+    img_name = os.path.basename(img_file).replace('.png', '')
+    
+    points, distances, intensities = load_pointcloud(pc_file)
+    if points is None or len(distances) == 0:
+        print(f"포인트클라우드 로드 실패: {pc_file}")
+        return None
+    
+    image = cv2.imread(img_file)
+    if image is None:
+        print(f"이미지 로드 실패: {img_file}")
+        return None
+    
+    result_image = image.copy()
+    valid_count = 0
+    
+    # 거리 통계 계산 (JSON 직렬화 가능하도록 변환)
+    min_dist = float(np.min(distances))
+    max_dist = float(np.max(distances))
+    mean_dist = float(np.mean(distances))
+    std_dist = float(np.std(distances))
+    
+    print(f"포인트클라우드 통계: 총 {len(points)}개, 거리 범위: {min_dist:.2f}~{max_dist:.2f}m")
+    
+    # 거리 정규화
+    norm_distances = (distances - min_dist) / (max_dist - min_dist) if max_dist > min_dist else np.zeros_like(distances)
+    
+    # 포인트 투영 (더 많은 디버깅 정보)
+    projection_attempts = 0
+    for i, point in enumerate(points):
+        projection_attempts += 1
+        pixel = project_point_standard(point, width, height)
+        
+        if pixel is not None:
+            u, v = pixel
+            if 0 <= u < width and 0 <= v < height:
+                # 더 눈에 띄는 색상과 크기
+                blue = int(255 * norm_distances[i])
+                red = int(255 * (1 - norm_distances[i]))
+                green = int(128)  # 녹색 성분 추가
+                point_size = max(2, int(8 * (1 - norm_distances[i])))  # 더 큰 포인트
+                cv2.circle(result_image, (u, v), point_size, (blue, green, red), -1)
+                valid_count += 1
+    
+    print(f"투영 결과: {valid_count}/{projection_attempts} 포인트가 이미지 내에 투영됨")
+    
+    # 타임스탬프 정보
+    img_ts = extract_timestamp_from_filename(img_file)
+    pc_ts = extract_timestamp_from_filename(pc_file)
+    ts_diff = abs(img_ts - pc_ts)
+    
+    # 정보 표시
+    info_text = f"PC: {pc_name[:15]}..., Img: {img_name[:15]}..."
+    cv2.putText(result_image, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    stats_text = f"Points: {valid_count}/{len(points)} ({valid_count/len(points)*100:.1f}%)"
+    cv2.putText(result_image, stats_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    ts_text = f"TS diff: {ts_diff}"
+    cv2.putText(result_image, ts_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    # 거리 정보 표시
+    dist_text = f"Dist: {min_dist:.1f}-{max_dist:.1f}m"
+    cv2.putText(result_image, dist_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    output_file = os.path.join(output_dir, f"projection_{img_name}_pc_{pc_name}.png")
+    cv2.imwrite(output_file, result_image)
+    
+    # 거리 통계 정보 반환
+    distance_stats = {
+        "min_distance": min_dist,
+        "max_distance": max_dist,
+        "mean_distance": mean_dist,
+        "std_distance": std_dist,
+        "has_intensity": intensities is not None,
+        "intensity_range": [float(np.min(intensities)), float(np.max(intensities))] if intensities is not None else None
+    }
+    
+    return output_file, valid_count, len(points), ts_diff, distance_stats
+
+def project_lidar_to_image(pc_file, img_file, lidar_to_camera, width, height, output_dir):
+    """캘리브레이션을 사용한 라이다 포인트 투영"""
+    pc_name = os.path.basename(pc_file).replace('.bin', '')
+    img_name = os.path.basename(img_file).replace('.png', '')
+    
+    points, distances, intensities = load_pointcloud(pc_file)
+    if points is None or len(distances) == 0:
+        print(f"포인트클라우드 로드 실패: {pc_file}")
+        return None
+    
+    image = cv2.imread(img_file)
+    if image is None:
+        print(f"이미지 로드 실패: {img_file}")
+        return None
+    
+    result_image = image.copy()
+    valid_count = 0
+    
+    # 거리 통계 계산 (JSON 직렬화 가능하도록 변환)
+    min_dist = float(np.min(distances))
+    max_dist = float(np.max(distances))
+    mean_dist = float(np.mean(distances))
+    std_dist = float(np.std(distances))
+    
+    print(f"포인트클라우드 통계: 총 {len(points)}개, 거리 범위: {min_dist:.2f}~{max_dist:.2f}m")
+    
+    # 거리 정규화
+    norm_distances = (distances - min_dist) / (max_dist - min_dist) if max_dist > min_dist else np.zeros_like(distances)
+    
+    # 포인트 투영 (캘리브레이션 사용)
+    projection_attempts = 0
+    for i, point in enumerate(points):
+        projection_attempts += 1
+        # 라이다→카메라 변환
+        camera_point = lidar_to_camera @ np.append(point, 1)
+        transformed_point = apply_y_flip(camera_point[:3])
+        pixel = project_point_standard(transformed_point, width, height)
+        
+        if pixel is not None:
+            u, v = pixel
+            if 0 <= u < width and 0 <= v < height:
+                # 더 눈에 띄는 색상과 크기
+                blue = int(255 * norm_distances[i])
+                red = int(255 * (1 - norm_distances[i]))
+                green = int(128)  # 녹색 성분 추가
+                point_size = max(2, int(8 * (1 - norm_distances[i])))  # 더 큰 포인트
+                cv2.circle(result_image, (u, v), point_size, (blue, green, red), -1)
+                valid_count += 1
+    
+    print(f"투영 결과: {valid_count}/{projection_attempts} 포인트가 이미지 내에 투영됨")
+    
+    # 타임스탬프 정보
+    img_ts = extract_timestamp_from_filename(img_file)
+    pc_ts = extract_timestamp_from_filename(pc_file)
+    ts_diff = abs(img_ts - pc_ts)
+    
+    # 정보 표시
+    info_text = f"PC: {pc_name[:15]}..., Img: {img_name[:15]}... (Calib)"
+    cv2.putText(result_image, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    stats_text = f"Points: {valid_count}/{len(points)} ({valid_count/len(points)*100:.1f}%)"
+    cv2.putText(result_image, stats_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    ts_text = f"TS diff: {ts_diff}"
+    cv2.putText(result_image, ts_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    # 거리 정보 표시
+    dist_text = f"Dist: {min_dist:.1f}-{max_dist:.1f}m"
+    cv2.putText(result_image, dist_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    output_file = os.path.join(output_dir, f"projection_{img_name}_pc_{pc_name}.png")
+    cv2.imwrite(output_file, result_image)
+    
+    # 거리 통계 정보 반환
+    distance_stats = {
+        "min_distance": min_dist,
+        "max_distance": max_dist,
+        "mean_distance": mean_dist,
+        "std_distance": std_dist,
+        "has_intensity": intensities is not None,
+        "intensity_range": [float(np.min(intensities)), float(np.max(intensities))] if intensities is not None else None
+    }
+    
+    return output_file, valid_count, len(points), ts_diff, distance_stats
+
+def create_colored_pointcloud(pc_file, img_file, lidar_to_camera, width, height, output_file):
+    """컬러 포인트클라우드 생성 (사용하지 않음)"""
+    pass
+
+def convert_to_serializable(obj):
+    """numpy 타입을 JSON 직렬화 가능한 타입으로 변환"""
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_to_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(item) for item in obj]
+    else:
+        return obj
+
+def main():
+    """메인 실행 함수"""
+    parser = argparse.ArgumentParser(description='Project LiDAR points to nearest timestamp images')
+    parser.add_argument('--base_dir', type=str, 
+                        default='/data/gpfs/projects/punim2482/workspace/PaRL/datasets/rosbag/input/IxT1',
+                        help='Base directory containing the data')
+    parser.add_argument('--rosbag_name', type=str, 
+                        default='rosbag2_2025_09_24-23_00_10',
+                        help='Name of the rosbag folder')
+    parser.add_argument('--output_suffix', type=str, 
+                        default='_projections',
+                        help='Suffix for output directory name')
+    parser.add_argument('--no_calibration', action='store_true',
+                        help='Use without calibration (equirectangular projection only)')
+    
+    args = parser.parse_args()
+    
+    base_dir = args.base_dir
+    rosbag_name = args.rosbag_name
+    
+    print(f"처리할 데이터: {base_dir}/{rosbag_name}")
+    
+    # 경로 설정
+    calib_file = os.path.join(base_dir, "calib_result", rosbag_name, "calib.json")
+    extracted_dir = os.path.join(base_dir, "extracted_frames", rosbag_name)
+    image_dir = os.path.join(extracted_dir, "images")
+    pointcloud_dir = os.path.join(extracted_dir, "pointclouds")
+    output_dir = os.path.join(base_dir, f"{rosbag_name}{args.output_suffix}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 파일 목록 가져오기
+    if not os.path.exists(image_dir) or not os.path.exists(pointcloud_dir):
+        print(f"디렉토리를 찾을 수 없습니다.")
+        print(f"이미지: {image_dir}")
+        print(f"포인트클라우드: {pointcloud_dir}")
+        return
+    
+    image_files = sorted([f for f in os.listdir(image_dir) if f.endswith('.png')])
+    pointcloud_files = sorted([os.path.join(pointcloud_dir, f) for f in os.listdir(pointcloud_dir) if f.endswith('.bin')])
+    
+    if not image_files or not pointcloud_files:
+        print("파일을 찾을 수 없습니다.")
+        return
+    
+    print(f"이미지 파일: {len(image_files)}개")
+    print(f"포인트클라우드 파일: {len(pointcloud_files)}개")
+    
+    # 타임스탬프 분석
+    img_timestamps, pc_timestamps, strategy = analyze_timestamps(image_files, pointcloud_files)
+    
+    # 캘리브레이션 로드
+    lidar_to_camera = None
+    width, height = 2880, 1440
+    
+    if not args.no_calibration and os.path.exists(calib_file):
+        try:
+            lidar_to_camera, camera_model, intrinsics = load_calibration(calib_file)
+            width, height = int(intrinsics[0]), int(intrinsics[1])
+            print(f"캘리브레이션 로드 완료: {camera_model}, {width}x{height}")
+        except Exception as e:
+            print(f"캘리브레이션 로드 실패: {e}")
+            lidar_to_camera = None
+    else:
+        # 이미지에서 크기 추정
+        first_image = cv2.imread(os.path.join(image_dir, image_files[0]))
+        if first_image is not None:
+            height, width = first_image.shape[:2]
+            print(f"이미지에서 크기 추정: {width}x{height}")
+    
+    # 매칭 결과 저장
+    matched_pairs = []
+    total_processed = 0
+    total_valid_points = 0
+    total_points = 0
+    timestamp_diffs = []
+    all_distance_stats = []
+    
+    print("\n시간별 매칭 및 투영 시작...")
+    
+    # 매칭 전략에 따른 처리
+    if strategy == "sequence":
+        # 시퀀스 기반 매칭
+        matches = find_nearest_by_sequence(image_files, pointcloud_files)
+        
+        for img_file, pc_file, sequence_diff in tqdm(matches, desc="Processing"):
+            img_path = os.path.join(image_dir, img_file)
+            img_timestamp = extract_timestamp_from_filename(img_file)
+            pc_timestamp = extract_timestamp_from_filename(pc_file)
+            
+            # 페어 정보 생성
+            pair_info = {
+                "image_file": img_file,
+                "image_timestamp": int(img_timestamp),  # 명시적 int 변환
+                "pointcloud_file": os.path.basename(pc_file),
+                "pointcloud_timestamp": int(pc_timestamp),  # 명시적 int 변환
+                "sequence_diff": int(sequence_diff),  # 명시적 int 변환
+                "matching_strategy": "sequence",
+                "processed": False
+            }
+            
+            # 투영 수행
+            if lidar_to_camera is not None:
+                result = project_lidar_to_image(pc_file, img_path, lidar_to_camera, width, height, output_dir)
+            else:
+                result = project_lidar_to_image_no_calib(pc_file, img_path, width, height, output_dir)
+            
+            if result is not None:
+                output_file, valid_count, total_point_count, ts_diff, distance_stats = result
+                
+                pair_info.update({
+                    "processed": True,
+                    "output_file": os.path.relpath(output_file, base_dir),
+                    "valid_points": int(valid_count),  # 명시적 int 변환
+                    "total_points": int(total_point_count),  # 명시적 int 변환
+                    "projection_ratio": float(valid_count / total_point_count) if total_point_count > 0 else 0.0
+                })
+                
+                # 거리 통계 추가
+                pair_info.update(distance_stats)
+                all_distance_stats.append(distance_stats)
+                
+                total_processed += 1
+                total_valid_points += valid_count
+                total_points += total_point_count
+                timestamp_diffs.append(sequence_diff)
+            
+            matched_pairs.append(pair_info)
+    
+    else:
+        # 타임스탬프 기반 매칭 (기존 방식)
+        pc_timestamps_cache = [extract_timestamp_from_filename(f) for f in pointcloud_files]
+        
+        for img_file in tqdm(image_files, desc="Processing"):
+            img_path = os.path.join(image_dir, img_file)
+            img_timestamp = extract_timestamp_from_filename(img_file)
+            
+            nearest_pc, time_diff = find_nearest_pointcloud_optimized(
+                img_timestamp, pointcloud_files, pc_timestamps_cache
+            )
+            
+            if nearest_pc is None:
+                continue
+            
+            pair_info = {
+                "image_file": img_file,
+                "image_timestamp": int(img_timestamp),  # 명시적 int 변환
+                "pointcloud_file": os.path.basename(nearest_pc),
+                "pointcloud_timestamp": int(extract_timestamp_from_filename(nearest_pc)),  # 명시적 int 변환
+                "timestamp_diff_ns": int(time_diff),  # 명시적 int 변환
+                "matching_strategy": "timestamp",
+                "processed": False
+            }
+            
+            if lidar_to_camera is not None:
+                result = project_lidar_to_image(nearest_pc, img_path, lidar_to_camera, width, height, output_dir)
+            else:
+                result = project_lidar_to_image_no_calib(nearest_pc, img_path, width, height, output_dir)
+            
+            if result is not None:
+                output_file, valid_count, total_point_count, ts_diff, distance_stats = result
+                
+                pair_info.update({
+                    "processed": True,
+                    "output_file": os.path.relpath(output_file, base_dir),
+                    "valid_points": int(valid_count),  # 명시적 int 변환
+                    "total_points": int(total_point_count),  # 명시적 int 변환
+                    "projection_ratio": float(valid_count / total_point_count) if total_point_count > 0 else 0.0
+                })
+                
+                # 거리 통계 추가
+                pair_info.update(distance_stats)
+                all_distance_stats.append(distance_stats)
+                
+                total_processed += 1
+                total_valid_points += valid_count
+                total_points += total_point_count
+                timestamp_diffs.append(time_diff)
+            
+            matched_pairs.append(pair_info)
+    
+    # 전체 거리 통계 계산
+    if all_distance_stats:
+        all_min_distances = [stat["min_distance"] for stat in all_distance_stats]
+        all_max_distances = [stat["max_distance"] for stat in all_distance_stats]
+        all_mean_distances = [stat["mean_distance"] for stat in all_distance_stats]
+        
+        global_distance_stats = {
+            "global_min_distance": float(np.min(all_min_distances)),
+            "global_max_distance": float(np.max(all_max_distances)),
+            "avg_min_distance": float(np.mean(all_min_distances)),
+            "avg_max_distance": float(np.mean(all_max_distances)),
+            "avg_mean_distance": float(np.mean(all_mean_distances))
+        }
+    else:
+        global_distance_stats = {}
+    
+    # 결과 JSON 저장
+    pairs_json_path = os.path.join(output_dir, "matched_pairs.json")
+    pairs_data = {
+        "metadata": {
+            "base_dir": base_dir,
+            "rosbag_name": rosbag_name,
+            "total_images": len(image_files),
+            "total_pointclouds": len(pointcloud_files),
+            "processed_pairs": int(total_processed),  # 명시적 int 변환
+            "calibration_used": lidar_to_camera is not None,
+            "image_size": [int(width), int(height)],  # 명시적 int 변환
+            "matching_strategy": strategy
+        },
+        "statistics": {
+            "total_valid_points": int(total_valid_points),  # 명시적 int 변환
+            "total_points": int(total_points),  # 명시적 int 변환
+            "overall_projection_ratio": float(total_valid_points / total_points) if total_points > 0 else 0.0,
+            "avg_diff": float(np.mean(timestamp_diffs)) if timestamp_diffs else 0.0,
+            "max_diff": float(np.max(timestamp_diffs)) if timestamp_diffs else 0.0,
+            "min_diff": float(np.min(timestamp_diffs)) if timestamp_diffs else 0.0
+        },
+        "distance_statistics": global_distance_stats,
+        "pairs": matched_pairs
+    }
+    
+    # JSON 직렬화 가능하도록 변환
+    pairs_data = convert_to_serializable(pairs_data)
+    
+    with open(pairs_json_path, 'w', encoding='utf-8') as f:
+        json.dump(pairs_data, f, indent=2, ensure_ascii=False)
+    
+    # 최종 결과
+    print(f"\n=== 처리 완료 ===")
+    print(f"처리된 이미지: {total_processed}/{len(image_files)}")
+    print(f"총 투영 포인트: {total_valid_points}/{total_points} ({total_valid_points/total_points*100:.1f}%)" if total_points > 0 else "총 투영 포인트: 0")
+    if timestamp_diffs:
+        print(f"평균 차이: {np.mean(timestamp_diffs):.1f}")
+        print(f"최대 차이: {np.max(timestamp_diffs):.1f}")
+    if global_distance_stats:
+        print(f"전체 거리 범위: {global_distance_stats['global_min_distance']:.2f}~{global_distance_stats['global_max_distance']:.2f}m")
+    print(f"결과 폴더: {output_dir}")
+    print(f"매칭 정보: {pairs_json_path}")
+
+if __name__ == "__main__":
+    main()

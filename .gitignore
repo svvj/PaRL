@@ -10,6 +10,7 @@
 
 datasets/*.7z
 datasets/Diverse360.*
+datasets/rosbag/*
 
 models/*
 
