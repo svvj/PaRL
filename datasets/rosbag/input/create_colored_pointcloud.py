@@ -110,20 +110,18 @@ def project_point_standard(point, width, height):
     
     return u_i, v_i
 
-def project_points_vectorized(points, lidar_to_camera, width, height, use_calibration=True):
+def project_points_vectorized(points, lidar_to_camera, width, height):
     """벡터화된 포인트 투영 with 퍼센타일 게이팅"""
     if len(points) == 0:
         return [], []
     
-    # 1. 변환 적용 (캘리브레이션 사용 시)
-    if use_calibration and lidar_to_camera is not None:
-        # 동차 좌표로 변환
-        P = np.hstack([points, np.ones((len(points), 1), dtype=np.float32)])   # (N,4)
-        Pc = (lidar_to_camera @ P.T).T[:, :3]                                 # (N,3)
-        # Y축 반전 적용
-        Pc = np.column_stack([Pc[:, 0], -Pc[:, 1], Pc[:, 2]])
-    else:
-        Pc = points.copy()
+    # 1. 변환 적용
+    # 동차 좌표로 변환
+    P = np.hstack([points, np.ones((len(points), 1), dtype=np.float32)])   # (N,4)
+    Pc = (lidar_to_camera @ P.T).T[:, :3]                                 # (N,3)
+    # Y축 반전 적용
+    Pc = np.column_stack([Pc[:, 0], -Pc[:, 1], Pc[:, 2]])
+
     
     # 2. 거리 계산
     r = np.linalg.norm(Pc, axis=1)
@@ -131,14 +129,12 @@ def project_points_vectorized(points, lidar_to_camera, width, height, use_calibr
     # 3. 프레임별 퍼센타일 게이팅 (이상치 제거)
     valid_r = r[np.isfinite(r) & (r > 1e-5)]
     if len(valid_r) > 0:
-        r_lo = np.percentile(valid_r, 0.5)   # 0.5% 하위 제거
-        r_hi = np.percentile(valid_r, 99.5)  # 99.5% 상위 제거
-    else:
-        r_lo, r_hi = 0.15, 50.0
+        r_lo = np.percentile(valid_r, 0.1)   # 0.1% 하위 제거
+        r_hi = np.percentile(valid_r, 99.9)  # 99.9% 상위 제거
     
     # 4. 유효한 포인트 마스크
     mask = (np.isfinite(Pc).all(axis=1) & 
-            (r > max(r_lo, 0.15)) & 
+            (r > r_lo) & 
             (r < r_hi) & 
             (np.abs(Pc[:, 2]) >= 1e-6))  # z=0 근처 불안정성 회피
     
@@ -314,7 +310,7 @@ def project_lidar_to_image(pc_file, img_file, lidar_to_camera, width, height, ou
         norm_distances = (distances - min_dist) / (max_dist - min_dist)
     
     # 벡터화된 투영 (캘리브레이션 사용)
-    projected_pixels, valid_mask = project_points_vectorized(points, lidar_to_camera, width, height, use_calibration=True)
+    projected_pixels, valid_mask = project_points_vectorized(points, lidar_to_camera, width, height)
     
     valid_count = len(projected_pixels)
     projection_attempts = np.sum(valid_mask)
@@ -405,8 +401,6 @@ def main():
     parser.add_argument('--output_suffix', type=str, 
                         default='_projections',
                         help='Suffix for output directory name')
-    parser.add_argument('--no_calibration', action='store_true',
-                        help='Use without calibration (equirectangular projection only)')
     
     args = parser.parse_args()
     
@@ -569,10 +563,7 @@ def main():
                 "processed": False
             }
             
-            if lidar_to_camera is not None:
-                result = project_lidar_to_image(nearest_pc, img_path, lidar_to_camera, width, height, output_dir)
-            else:
-                result = project_lidar_to_image_no_calib(nearest_pc, img_path, width, height, output_dir)
+            result = project_lidar_to_image(nearest_pc, img_path, lidar_to_camera, width, height, output_dir)
             
             if result is not None:
                 output_file, valid_count, total_point_count, ts_diff, distance_stats = result
