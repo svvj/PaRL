@@ -66,6 +66,9 @@ def load_pointcloud(pointcloud_file, max_distance=50.0):
     # 유효한 포인트만 필터링
     mask = np.all(np.isfinite(xyz), axis=1) & np.all(np.abs(xyz) < 100.0, axis=1)
     xyz = xyz[mask]
+
+    if np.isnan(xyz).any() or np.isinf(xyz).any():
+        print(f"[NaN/Inf Error] {pointcloud_file}")
     
     # 거리 기반 필터링
     distances = np.linalg.norm(xyz, axis=1)
@@ -78,10 +81,14 @@ def load_pointcloud(pointcloud_file, max_distance=50.0):
     return xyz, distances[distance_mask], intensities
 
 def project_point_standard(point, width, height):
-    """표준 equirectangular 투영 공식 사용"""
-    depth = np.sqrt(np.sum(point**2))
+    """표준 equirectangular 투영 공식 사용 (개선된 수치 안정성)"""
+    depth = np.linalg.norm(point)
     if depth < 1e-5:
         return None
+    
+    # z가 너무 0 근처면, phi = atan2(x, z) 가 급격히 요동할 수 있음
+    if abs(point[2]) < 1e-6 and abs(point[0]) > 1e-6:
+        return None  # 혹은 작은 바이어스 적용 가능
     
     # 표준 공식: 
     # longitude (φ) = arctan2(x, z)
@@ -97,8 +104,57 @@ def project_point_standard(point, width, height):
     # v = (0.5 - θ/π) * height
     u = ((phi / (2 * np.pi)) + 0.5) * width
     v = (0.5 - (theta / np.pi)) * height
+
+    u_i = int(round(u))
+    v_i = int(round(v))
     
-    return int(u) % width, int(v) % height
+    return u_i, v_i
+
+def project_points_vectorized(points, lidar_to_camera, width, height, use_calibration=True):
+    """벡터화된 포인트 투영 with 퍼센타일 게이팅"""
+    if len(points) == 0:
+        return [], []
+    
+    # 1. 변환 적용 (캘리브레이션 사용 시)
+    if use_calibration and lidar_to_camera is not None:
+        # 동차 좌표로 변환
+        P = np.hstack([points, np.ones((len(points), 1), dtype=np.float32)])   # (N,4)
+        Pc = (lidar_to_camera @ P.T).T[:, :3]                                 # (N,3)
+        # Y축 반전 적용
+        Pc = np.column_stack([Pc[:, 0], -Pc[:, 1], Pc[:, 2]])
+    else:
+        Pc = points.copy()
+    
+    # 2. 거리 계산
+    r = np.linalg.norm(Pc, axis=1)
+    
+    # 3. 프레임별 퍼센타일 게이팅 (이상치 제거)
+    valid_r = r[np.isfinite(r) & (r > 1e-5)]
+    if len(valid_r) > 0:
+        r_lo = np.percentile(valid_r, 0.5)   # 0.5% 하위 제거
+        r_hi = np.percentile(valid_r, 99.5)  # 99.5% 상위 제거
+    else:
+        r_lo, r_hi = 0.15, 50.0
+    
+    # 4. 유효한 포인트 마스크
+    mask = (np.isfinite(Pc).all(axis=1) & 
+            (r > max(r_lo, 0.15)) & 
+            (r < r_hi) & 
+            (np.abs(Pc[:, 2]) >= 1e-6))  # z=0 근처 불안정성 회피
+    
+    # 5. 투영 좌표 계산
+    valid_points = Pc[mask]
+    valid_indices = np.where(mask)[0]
+    projected_pixels = []
+    
+    for i, point in enumerate(valid_points):
+        pixel = project_point_standard(point, width, height)
+        if pixel is not None:
+            u, v = pixel
+            if 0 <= u < width and 0 <= v < height:
+                projected_pixels.append((valid_indices[i], u, v))
+    
+    return projected_pixels, mask
 
 def apply_y_flip(point):
     """Y축 반전 적용"""
@@ -226,90 +282,8 @@ def find_nearest_pointcloud_optimized(image_timestamp, pointcloud_files, pc_time
     
     return pointcloud_files[min_idx], diffs[min_idx]
 
-def project_lidar_to_image_no_calib(pc_file, img_file, width, height, output_dir):
-    """캘리브레이션 없이 라이다 포인트를 이미지에 투영"""
-    pc_name = os.path.basename(pc_file).replace('.bin', '')
-    img_name = os.path.basename(img_file).replace('.png', '')
-    
-    points, distances, intensities = load_pointcloud(pc_file)
-    if points is None or len(distances) == 0:
-        print(f"포인트클라우드 로드 실패: {pc_file}")
-        return None
-    
-    image = cv2.imread(img_file)
-    if image is None:
-        print(f"이미지 로드 실패: {img_file}")
-        return None
-    
-    result_image = image.copy()
-    valid_count = 0
-    
-    # 거리 통계 계산 (JSON 직렬화 가능하도록 변환)
-    min_dist = float(np.min(distances))
-    max_dist = float(np.max(distances))
-    mean_dist = float(np.mean(distances))
-    std_dist = float(np.std(distances))
-    
-    print(f"포인트클라우드 통계: 총 {len(points)}개, 거리 범위: {min_dist:.2f}~{max_dist:.2f}m")
-    
-    # 거리 정규화
-    norm_distances = (distances - min_dist) / (max_dist - min_dist) if max_dist > min_dist else np.zeros_like(distances)
-    
-    # 포인트 투영 (더 많은 디버깅 정보)
-    projection_attempts = 0
-    for i, point in enumerate(points):
-        projection_attempts += 1
-        pixel = project_point_standard(point, width, height)
-        
-        if pixel is not None:
-            u, v = pixel
-            if 0 <= u < width and 0 <= v < height:
-                # 더 눈에 띄는 색상과 크기
-                blue = int(255 * norm_distances[i])
-                red = int(255 * (1 - norm_distances[i]))
-                green = int(128)  # 녹색 성분 추가
-                point_size = max(2, int(8 * (1 - norm_distances[i])))  # 더 큰 포인트
-                cv2.circle(result_image, (u, v), point_size, (blue, green, red), -1)
-                valid_count += 1
-    
-    print(f"투영 결과: {valid_count}/{projection_attempts} 포인트가 이미지 내에 투영됨")
-    
-    # 타임스탬프 정보
-    img_ts = extract_timestamp_from_filename(img_file)
-    pc_ts = extract_timestamp_from_filename(pc_file)
-    ts_diff = abs(img_ts - pc_ts)
-    
-    # 정보 표시
-    info_text = f"PC: {pc_name[:15]}..., Img: {img_name[:15]}..."
-    cv2.putText(result_image, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-    
-    stats_text = f"Points: {valid_count}/{len(points)} ({valid_count/len(points)*100:.1f}%)"
-    cv2.putText(result_image, stats_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-    
-    ts_text = f"TS diff: {ts_diff}"
-    cv2.putText(result_image, ts_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-    
-    # 거리 정보 표시
-    dist_text = f"Dist: {min_dist:.1f}-{max_dist:.1f}m"
-    cv2.putText(result_image, dist_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-    
-    output_file = os.path.join(output_dir, f"projection_{img_name}_pc_{pc_name}.png")
-    cv2.imwrite(output_file, result_image)
-    
-    # 거리 통계 정보 반환
-    distance_stats = {
-        "min_distance": min_dist,
-        "max_distance": max_dist,
-        "mean_distance": mean_dist,
-        "std_distance": std_dist,
-        "has_intensity": intensities is not None,
-        "intensity_range": [float(np.min(intensities)), float(np.max(intensities))] if intensities is not None else None
-    }
-    
-    return output_file, valid_count, len(points), ts_diff, distance_stats
-
 def project_lidar_to_image(pc_file, img_file, lidar_to_camera, width, height, output_dir):
-    """캘리브레이션을 사용한 라이다 포인트 투영"""
+    """캘리브레이션을 사용한 라이다 포인트 투영 (개선된 버전)"""
     pc_name = os.path.basename(pc_file).replace('.bin', '')
     img_name = os.path.basename(img_file).replace('.png', '')
     
@@ -324,9 +298,8 @@ def project_lidar_to_image(pc_file, img_file, lidar_to_camera, width, height, ou
         return None
     
     result_image = image.copy()
-    valid_count = 0
     
-    # 거리 통계 계산 (JSON 직렬화 가능하도록 변환)
+    # 거리 통계 계산 (안정성 개선)
     min_dist = float(np.min(distances))
     max_dist = float(np.max(distances))
     mean_dist = float(np.mean(distances))
@@ -334,28 +307,36 @@ def project_lidar_to_image(pc_file, img_file, lidar_to_camera, width, height, ou
     
     print(f"포인트클라우드 통계: 총 {len(points)}개, 거리 범위: {min_dist:.2f}~{max_dist:.2f}m")
     
-    # 거리 정규화
-    norm_distances = (distances - min_dist) / (max_dist - min_dist) if max_dist > min_dist else np.zeros_like(distances)
+    # 거리 정규화 (안정성 개선)
+    if max_dist - min_dist < 1e-6:
+        norm_distances = np.zeros_like(distances)
+    else:
+        norm_distances = (distances - min_dist) / (max_dist - min_dist)
     
-    # 포인트 투영 (캘리브레이션 사용)
-    projection_attempts = 0
-    for i, point in enumerate(points):
-        projection_attempts += 1
-        # 라이다→카메라 변환
-        camera_point = lidar_to_camera @ np.append(point, 1)
-        transformed_point = apply_y_flip(camera_point[:3])
-        pixel = project_point_standard(transformed_point, width, height)
+    # 벡터화된 투영 (캘리브레이션 사용)
+    projected_pixels, valid_mask = project_points_vectorized(points, lidar_to_camera, width, height, use_calibration=True)
+    
+    valid_count = len(projected_pixels)
+    projection_attempts = np.sum(valid_mask)
+    
+    # 투영된 포인트 그리기
+    for orig_idx, u, v in projected_pixels:
+        # 거리를 0-255 범위로 정규화
+        depth_value = int(norm_distances[orig_idx] * 255)
         
-        if pixel is not None:
-            u, v = pixel
-            if 0 <= u < width and 0 <= v < height:
-                # 더 눈에 띄는 색상과 크기
-                blue = int(255 * norm_distances[i])
-                red = int(255 * (1 - norm_distances[i]))
-                green = int(128)  # 녹색 성분 추가
-                point_size = max(2, int(8 * (1 - norm_distances[i])))  # 더 큰 포인트
-                cv2.circle(result_image, (u, v), point_size, (blue, green, red), -1)
-                valid_count += 1
+        # OpenCV COLORMAP_VIRIDIS 사용 (아름다운 보라-파랑-초록-노랑 그라데이션)
+        color = cv2.applyColorMap(np.array([[depth_value]], dtype=np.uint8), cv2.COLORMAP_VIRIDIS)[0, 0]
+        b, g, r = int(color[0]), int(color[1]), int(color[2])
+        
+        # 더 큰 점과 부드러운 가장자리를 위한 안티앨리어싱
+        # 메인 포인트 (크기 2)
+        cv2.circle(result_image, (u, v), 2, (b, g, r), -1)
+        
+        # 투명한 테두리 효과를 위한 더 큰 원 (크기 3, 더 연한 색상)
+        border_b = min(255, b + 30)
+        border_g = min(255, g + 30) 
+        border_r = min(255, r + 30)
+        cv2.circle(result_image, (u, v), 3, (border_b, border_g, border_r), 1)
     
     print(f"투영 결과: {valid_count}/{projection_attempts} 포인트가 이미지 내에 투영됨")
     
@@ -374,8 +355,8 @@ def project_lidar_to_image(pc_file, img_file, lidar_to_camera, width, height, ou
     ts_text = f"TS diff: {ts_diff}"
     cv2.putText(result_image, ts_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     
-    # 거리 정보 표시
-    dist_text = f"Dist: {min_dist:.1f}-{max_dist:.1f}m"
+    # 거리 정보 표시 + 색상 범례 (업데이트된 설명)
+    dist_text = f"Dist: {min_dist:.1f}-{max_dist:.1f}m (Purple=Close, Yellow=Far)"
     cv2.putText(result_image, dist_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     
     output_file = os.path.join(output_dir, f"projection_{img_name}_pc_{pc_name}.png")
@@ -435,7 +416,33 @@ def main():
     print(f"처리할 데이터: {base_dir}/{rosbag_name}")
     
     # 경로 설정
-    calib_file = os.path.join(base_dir, "calib_result", rosbag_name, "calib.json")
+    print(f"처리할 데이터: {base_dir}/{rosbag_name}")
+    
+    # 경로 설정: calib_result 안에 하나의 rosbag 폴더(또는 직접 calib.json)가 있으면 자동 선택
+    calib_root = os.path.join(base_dir, "calib_result")
+    calib_file = None
+    if os.path.isdir(calib_root):
+        # calib_result/calib.json 직접 있는 경우 우선 사용
+        direct_calib = os.path.join(calib_root, "calib.json")
+        if os.path.exists(direct_calib):
+            calib_file = direct_calib
+            print(f"calib_result/calib.json 사용: {calib_file}")
+        else:
+            # 폴더 목록 수집
+            subdirs = [d for d in os.listdir(calib_root) if os.path.isdir(os.path.join(calib_root, d))]
+            if len(subdirs) == 1:
+                calib_file = os.path.join(calib_root, subdirs[0], "calib.json")
+                print(f"calib_result에서 단일 폴더 발견, 해당 폴더 사용: {subdirs[0]}")
+            elif rosbag_name and os.path.isdir(os.path.join(calib_root, rosbag_name)):
+                # 기존 동작(rosbag_name 폴더가 있으면 사용)
+                calib_file = os.path.join(calib_root, rosbag_name, "calib.json")
+                print(f"rosbag_name 폴더에서 캘리브레이션 사용: {rosbag_name}")
+            elif subdirs:
+                # 여러 폴더가 있으면 첫 번째를 사용하되 경고 출력
+                calib_file = os.path.join(calib_root, subdirs[0], "calib.json")
+                print(f"calib_result에 여러 폴더가 있습니다. 첫 번째 폴더 사용: {subdirs[0]}")
+    else:
+        print("calib_result 폴더가 존재하지 않음. 캘리브레이션 없이 실행합니다.")
     extracted_dir = os.path.join(base_dir, "extracted_frames", rosbag_name)
     image_dir = os.path.join(extracted_dir, "images")
     pointcloud_dir = os.path.join(extracted_dir, "pointclouds")
@@ -513,10 +520,7 @@ def main():
             }
             
             # 투영 수행
-            if lidar_to_camera is not None:
-                result = project_lidar_to_image(pc_file, img_path, lidar_to_camera, width, height, output_dir)
-            else:
-                result = project_lidar_to_image_no_calib(pc_file, img_path, width, height, output_dir)
+            result = project_lidar_to_image(pc_file, img_path, lidar_to_camera, width, height, output_dir)
             
             if result is not None:
                 output_file, valid_count, total_point_count, ts_diff, distance_stats = result
