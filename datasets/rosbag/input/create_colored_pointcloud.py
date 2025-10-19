@@ -33,35 +33,19 @@ def load_calibration(calib_file):
     
     return lidar_to_camera, camera_model, intrinsics
 
-def load_pointcloud(pointcloud_file, max_distance=50.0):
+def load_pointcloud(pointcloud_file, max_distance=130.0):
     """포인트 클라우드 파일을 로드하고 필터링"""
     if pointcloud_file.endswith('.bin'):
         with open(pointcloud_file, 'rb') as f:
             data = f.read()
         
-        try:
-            # XYZI 형식 (4채널) 시도
-            points = np.frombuffer(data, dtype=np.float32).reshape(-1, 4)
-            xyz = points[:, :3]
-            if points.shape[1] >= 4:
-                # 인텐시티가 있는 경우 저장
-                intensities = points[:, 3]
-            else:
-                intensities = None
-        except ValueError:
-            try:
-                # XYZ 형식 (3채널) 시도
-                xyz = np.frombuffer(data, dtype=np.float32).reshape(-1, 3)
-                intensities = None
-            except ValueError:
-                return None, None, None
+        xyz = np.frombuffer(data, dtype=np.float32).reshape(-1, 3)
     else:
         # Open3D 지원 형식
         pcd = o3d.io.read_point_cloud(pointcloud_file)
         if not pcd.has_points():
             return None, None, None
         xyz = np.asarray(pcd.points)
-        intensities = None
     
     # 유효한 포인트만 필터링
     mask = np.all(np.isfinite(xyz), axis=1) & np.all(np.abs(xyz) < 100.0, axis=1)
@@ -75,10 +59,7 @@ def load_pointcloud(pointcloud_file, max_distance=50.0):
     distance_mask = distances < max_distance
     xyz = xyz[distance_mask]
     
-    if intensities is not None:
-        intensities = intensities[mask][distance_mask]
-    
-    return xyz, distances[distance_mask], intensities
+    return xyz, distances[distance_mask]
 
 def project_point_standard(point, width, height):
     """표준 equirectangular 투영 공식 사용 (개선된 수치 안정성)"""
@@ -283,7 +264,7 @@ def project_lidar_to_image(pc_file, img_file, lidar_to_camera, width, height, ou
     pc_name = os.path.basename(pc_file).replace('.bin', '')
     img_name = os.path.basename(img_file).replace('.png', '')
     
-    points, distances, intensities = load_pointcloud(pc_file)
+    points, distances = load_pointcloud(pc_file)
     if points is None or len(distances) == 0:
         print(f"포인트클라우드 로드 실패: {pc_file}")
         return None
@@ -363,9 +344,7 @@ def project_lidar_to_image(pc_file, img_file, lidar_to_camera, width, height, ou
         "min_distance": min_dist,
         "max_distance": max_dist,
         "mean_distance": mean_dist,
-        "std_distance": std_dist,
-        "has_intensity": intensities is not None,
-        "intensity_range": [float(np.min(intensities)), float(np.max(intensities))] if intensities is not None else None
+        "std_distance": std_dist
     }
     
     return output_file, valid_count, len(points), ts_diff, distance_stats
@@ -467,7 +446,7 @@ def main():
     lidar_to_camera = None
     width, height = 2880, 1440
     
-    if not args.no_calibration and os.path.exists(calib_file):
+    if os.path.exists(calib_file):
         try:
             lidar_to_camera, camera_model, intrinsics = load_calibration(calib_file)
             width, height = int(intrinsics[0]), int(intrinsics[1])
